@@ -5,11 +5,141 @@ Copyright (c) 2024 Fortinet Inc
 Copyright end
 """
 
-import base64, ipaddress, json, ldap3, time
+import base64, datetime, ipaddress, json, ldap3, time
 from connectors.core.connector import get_logger, ConnectorError
 from .constant import *
 
 logger = get_logger('activedirectory')
+
+
+# Optional Kerberos support using Impacket. Imports are kept optional so the
+# connector can still run in non-Kerberos mode if Impacket is not installed.
+try:
+    from pyasn1.codec.ber import decoder, encoder
+    from pyasn1.type.univ import noValue
+    from impacket.krb5 import constants
+    from impacket.krb5.asn1 import AP_REQ, Authenticator, TGS_REP, seq_set
+    from impacket.krb5.kerberosv5 import getKerberosTGT, getKerberosTGS
+    from impacket.krb5.types import Principal, KerberosTime, Ticket
+    from impacket.spnego import SPNEGO_NegTokenInit, TypesMech
+    IMPACKET_KERBEROS_AVAILABLE = True
+    IMPACKET_KRB_IMPORT_ERROR = None
+except Exception as r:
+    IMPACKET_KERBEROS_AVAILABLE = False
+    IMPACKET_KRB_IMPORT_ERROR = str(r)
+
+def _first_value(value):
+    # Return the first value when ldap3 serializes an AD attribute as a list.
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+def _int_value(value, default=None):
+    #Convert AD scalar/list values to int.
+    value = _first_value(value)
+    if value is None or value == '':
+        return default
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+def _kerberos_spnego_token(username, password, realm, service_principal, kdc_host=None, lmhash='', nthash='', aes_key=None):
+    
+    # inspired on https://github.com/fortra/impacket/blob/master/impacket/ldap/ldap.py
+
+    # Get tgt via impacket getKerberosTGT()
+    user_principal = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+    tgt, cipher, old_session_key, session_key = getKerberosTGT(user_principal, password, realm, lmhash, nthash, aes_key, kdc_host)
+
+    # Get tgs via impacket getKerberosTGS
+    server_principal = Principal(service_principal, type=constants.PrincipalNameType.NT_SRV_INST.value)
+    tgs, cipher, old_session_key, session_key = getKerberosTGS(server_principal, realm, kdc_host, tgt, cipher, session_key)
+
+    # Extract ST from TGS and build the AP_REQ
+    tgs = decoder.decode(tgs, asn1Spec=TGS_REP())[0]
+    ticket = Ticket()
+    ticket.from_asn1(tgs['ticket'])
+
+    ap_req = AP_REQ()
+    ap_req['pvno'] = 5
+    ap_req['msg-type'] = int(constants.ApplicationTagNumbers.AP_REQ.value)
+    ap_req['ap-options'] = constants.encodeFlags([])
+    seq_set(ap_req, 'ticket', ticket.to_asn1)
+
+    authenticator = Authenticator()
+    authenticator['authenticator-vno'] = 5
+    authenticator['crealm'] = realm
+    seq_set(authenticator, 'cname', user_principal.components_to_asn1)
+    now = datetime.datetime.utcnow()
+    authenticator['cusec'] = now.microsecond
+    authenticator['ctime'] = KerberosTime.to_asn1(now)
+
+    encoded_authenticator = encoder.encode(authenticator)
+    encrypted_authenticator = cipher.encrypt(session_key, 11, encoded_authenticator, None)
+
+    ap_req['authenticator'] = noValue
+    ap_req['authenticator']['etype'] = cipher.enctype
+    ap_req['authenticator']['cipher'] = encrypted_authenticator
+
+    # Build SPNEGO blob
+    blob = SPNEGO_NegTokenInit()
+    blob['MechTypes'] = [TypesMech['MS KRB5 - Microsoft Kerberos 5']]
+    blob['MechToken'] = encoder.encode(ap_req)
+    return blob.getData()
+
+
+def bind_server_kerberos(hostname, custom_port, username, password, base_dn, use_tls,
+                         kerberos_realm=None, kerberos_kdc_host=None, kerberos_spn_hostname=None,
+                         kerberos_lmhash='', kerberos_nthash='', kerberos_aes_key=None):
+
+    # check if impacket kereberos is loaded
+    if not IMPACKET_KERBEROS_AVAILABLE:
+        raise ConnectorError('Kerberos authentication requires impacket and pyasn1 packages to be installed.'f'Import error : {IMPACKET_KRB_IMPORT_ERROR}')
+
+    try:
+        port = custom_port if custom_port else (SSL_PORT if use_tls else PORT)
+        spn_host = kerberos_spn_hostname or hostname
+        service_principal = f'ldap/{format(spn_host)}'
+
+        server = ldap3.Server(host=hostname, port=port, use_ssl=use_tls, get_info=ldap3.ALL)
+        conn = ldap3.Connection(server=server, raise_exceptions=True)
+
+        token = _kerberos_spnego_token(
+            username=username,
+            password=password,
+            realm=kerberos_realm,
+            service_principal=service_principal,
+            kdc_host=kerberos_kdc_host,
+            # Impacket requires LM/NT hash arguments, but they are not used when a password is provided.
+            lmhash=kerberos_lmhash or '',
+            nthash=kerberos_nthash or '',
+            aes_key=kerberos_aes_key
+        )
+
+        request = ldap3.operation.bind.bind_operation(conn.version, ldap3.SASL, username, None, 'GSS-SPNEGO', token)
+
+        if conn.closed:
+            conn.open(read_server_info=False)
+
+        conn.sasl_in_progress = True
+        response = conn.post_send_single_response(conn.send('bindRequest', request, None))
+        conn.sasl_in_progress = False
+
+        if not response or response[0].get('result') != 0:
+            raise ConnectorError(f'Kerberos bind failed: {str(response)}')
+
+        conn.bound = True
+
+        result = conn.extend.standard.who_am_i()
+        if not result:
+            raise ConnectorError('Kerberos authentication failed: who_am_i returned an empty response')
+
+        logger.info(f'Kerberos bind successfully: {str(result)}')
+        return conn
+
+    except Exception as err:
+        raise ConnectorError(err)
 
 
 def bind_server(hostname, custom_port, username, password, use_tls):
@@ -23,8 +153,7 @@ def bind_server(hostname, custom_port, username, password, use_tls):
             else:
                 port = PORT
             auto_bind = ldap3.AUTO_BIND_NO_TLS
-        conn = ldap3.Connection(ldap3.Server(hostname, port=port, use_ssl=use_tls), auto_bind=auto_bind,
-                                user=username, password=password)
+        conn = ldap3.Connection(ldap3.Server(hostname, port=port, use_ssl=use_tls), auto_bind=auto_bind,user=username, password=password)
         if use_tls:
             conn.start_tls()
         if conn.result:
@@ -60,6 +189,26 @@ def server_connection(config):
         baseDN = config.get('baseDN')
         bindDN = config.get('bindDN')
         use_tls = config.get('use_tls', False)
+        use_kerberos = config.get('use_kerberos', False)
+
+        if use_kerberos:
+            if not config.get('kerberos_realm'):
+                raise ConnectorError('Kerberos realm could not be resolved. Set kerberos_realm.')
+            else:
+                return bind_server_kerberos(
+                    hostname=hostname,
+                    custom_port=port,
+                    username=username,
+                    password=password,
+                    base_dn=baseDN,
+                    use_tls=use_tls,
+                    kerberos_realm=config.get('kerberos_realm'),
+                    kerberos_kdc_host=config.get('kerberos_kdc_host'),
+                    kerberos_spn_hostname=config.get('kerberos_spn_hostname'),
+                    kerberos_lmhash=config.get('kerberos_lmhash', ''),
+                    kerberos_nthash=config.get('kerberos_nthash', ''),
+                    kerberos_aes_key=config.get('kerberos_aes_key')
+                )
         if bindDN:
             return bind_server(hostname, port, bindDN, password, use_tls)
         if '@' not in username and '\\' not in username:
@@ -121,7 +270,13 @@ def convert_ad_timestamp(timestamp):
 def search(conn, baseDN, filter_str, size_limit=0, page_size=None, cookie=None):
     try:
         if cookie:
-            cookie = base64.b64decode(cookie)
+            if isinstance(cookie, bytes):
+                cookie = base64.b64decode(cookie)
+            elif isinstance(cookie, str):
+                cookie = base64.b64decode(cookie.encode('ascii'))
+            else:
+                logger.warning('Ignoring invalid LDAP pagination cookie type: {0}'.format(type(cookie).__name__))
+                cookie = None
         conn.search(search_base=baseDN,
                     search_filter=filter_str,
                     search_scope=ldap3.SUBTREE,
@@ -132,11 +287,14 @@ def search(conn, baseDN, filter_str, size_limit=0, page_size=None, cookie=None):
                     )
         controls = conn.result.get('controls')
         if controls:
-            cookie = controls.get('1.2.840.113556.1.4.319').get('value').get('cookie')
-            cookie = base64.b64encode(cookie)
+            paged_control = controls.get('1.2.840.113556.1.4.319')
+            if paged_control:
+                cookie = paged_control.get('value', {}).get('cookie')
+                cookie = base64.b64encode(cookie).decode('ascii') if cookie else None
+            else:
+                cookie = None
         else:
-            if cookie:
-                cookie = base64.b64encode(cookie)
+            cookie = None
         result_set = conn.response_to_json()
         if result_set:
             result_set = result_set.replace(u'\u0000', '').replace(u'\\u0000', '')
@@ -216,7 +374,7 @@ def perform_action(config, params, action, object_type=None):
         entries = json_data.get('entries')
         if entries:
             dn = entries[0]['dn']
-            userAccountControl = entries[0]['attributes']['userAccountControl']
+            userAccountControl = _int_value(entries[0]['attributes']['userAccountControl'], default=0)
             if action.lower() == 'enable':
                 flag = userAccountControl & ~userADAccountControlFlag
             elif action.lower() == 'disable':
@@ -281,20 +439,32 @@ def formatting_data(json_data):
         for each_dict in entries:
             attributes = each_dict['attributes']
             for key, val in attributes.items():
+                clean_val = _first_value(val)
+
                 if key == 'userAccountControl':
-                    attributes[key] = get_user_account_control_detail(val)
+                    if clean_val is not None:
+                        attributes[key] = get_user_account_control_detail(clean_val)
+
                 if key == 'sAMAccountType':
-                    hex_val = hex(int(val))
-                    attributes[key] = SAM_ACCOUNT_TYPE_DICT[hex_val]
+                    if clean_val is not None:
+                        int_val = _int_value(clean_val)
+                        if int_val is not None:
+                            hex_val = hex(int_val)
+                            attributes[key] = SAM_ACCOUNT_TYPE_DICT.get(hex_val, clean_val)
+
                 if key in convert_ad_ts:
                     attributes[key] = convert_ad_timestamp(val)
+
                 if key in ip_details:
-                    attributes[key] = str(decimal_to_ip_address(int(val)))
+                    int_val = _int_value(clean_val)
+                    if int_val is not None:
+                        attributes[key] = str(decimal_to_ip_address(int_val))
+
                 if key == 'groupType':
                     try:
-                        attributes[key] = list(GROUP_TYPE.keys())[list(GROUP_TYPE.values()).index(val)]
+                        attributes[key] = list(GROUP_TYPE.keys())[list(GROUP_TYPE.values()).index(clean_val)]
                     except ValueError:
-                        attributes[key] = val
+                        attributes[key] = clean_val
     return json_data
 
 
