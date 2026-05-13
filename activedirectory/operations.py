@@ -204,7 +204,7 @@ def server_connection(config):
                     use_tls=use_tls,
                     kerberos_realm=config.get('kerberos_realm'),
                     kerberos_kdc_host=config.get('kerberos_kdc_host'),
-                    kerberos_spn_hostname=config.get('kerberos_spn_hostname'),
+                    kerberos_spn_hostname=config.get('kerberos_spn_hostname') or config.get('kerberos_kdc_host'),
                     kerberos_lmhash=config.get('kerberos_lmhash', ''),
                     kerberos_nthash=config.get('kerberos_nthash', ''),
                     kerberos_aes_key=config.get('kerberos_aes_key')

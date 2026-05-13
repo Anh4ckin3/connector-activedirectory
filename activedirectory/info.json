@@ -93,6 +93,50 @@
         "visible": true,
         "editable": true,
         "value": false
+      },
+      {
+          "title": "Use Kerberos",
+          "name": "use_kerberos",
+          "type": "checkbox",
+          "description": "Use Kerberos authentication for LDAP bind.",
+          "tooltip": "Enable Kerberos authentication instead of the default LDAP bind workflow.",
+          "required": false,
+          "visible": true,
+          "editable": true,
+          "value": false
+      },
+      {
+          "title": "Kerberos Realm",
+          "name": "kerberos_realm",
+          "type": "text",
+          "description": "Kerberos realm, usually the AD DNS domain in uppercase, for example EXAMPLE.COM.",
+          "tooltip": "Optional Kerberos realm. Example: EXAMPLE.COM",
+          "required": false,
+          "visible": true,
+          "editable": true,
+          "value": ""
+      },
+      {
+          "title": "Kerberos KDC Host",
+          "name": "kerberos_kdc_host",
+          "type": "text",
+          "description": "KDC/domain controller hostname used to request Kerberos tickets.",
+          "tooltip": "Optional KDC host, for example dc01.example.com.",
+          "required": false,
+          "visible": true,
+          "editable": true,
+          "value": ""
+      },
+      {
+          "title": "Kerberos SPN Hostname",
+          "name": "kerberos_spn_hostname",
+          "type": "text",
+          "description": "Optional hostname used to build the LDAP SPN ldap/<FQDN>.",
+          "tooltip": "Optional SPN hostname. Example: dc01.example.com",
+          "required": false,
+          "visible": true,
+          "editable": true,
+          "value": ""
       }
     ]
   },
